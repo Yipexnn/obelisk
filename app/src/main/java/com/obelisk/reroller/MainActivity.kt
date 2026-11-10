@@ -28,7 +28,6 @@ class MainActivity : Activity() {
     private lateinit var tapDelay: EditText
     private lateinit var confirmDelay: EditText
     private lateinit var openAllDelay: EditText
-    private lateinit var summaryDelay: EditText
     private lateinit var serviceState: TextView
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -97,7 +96,6 @@ class MainActivity : Activity() {
         tapDelay = labeled("Wait after tap", cfg.tapDelay.toString())
         confirmDelay = labeled("Wait between 💎200 taps", cfg.confirmDelay.toString())
         openAllDelay = labeled("Extra wait after Open All finished", cfg.openAllDelay.toString())
-        summaryDelay = labeled("Wait for Summary popup", cfg.summaryDelay.toString())
 
         root.addView(button("💾 Save") { save() })
     }
@@ -123,7 +121,7 @@ class MainActivity : Activity() {
             tapDelay = tapDelay.text.toString().toLongOrNull() ?: old.tapDelay,
             confirmDelay = confirmDelay.text.toString().toLongOrNull() ?: old.confirmDelay,
             openAllDelay = openAllDelay.text.toString().toLongOrNull() ?: old.openAllDelay,
-            summaryDelay = summaryDelay.text.toString().toLongOrNull() ?: old.summaryDelay,
+            summaryDelay = old.summaryDelay,
             points = old.points,
         ).save(this)
         Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()

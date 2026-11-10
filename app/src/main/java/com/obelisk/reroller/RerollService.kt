@@ -283,14 +283,42 @@ class RerollService : AccessibilityService() {
 
     private class Shot(val bmp: Bitmap, val lines: List<OLine>)
 
+    private suspend fun ocrBitmap(bmp: Bitmap): Text = suspendCancellableCoroutine { c ->
+        recognizer.process(InputImage.fromBitmap(bmp, 0))
+            .addOnSuccessListener { if (c.isActive) c.resume(it) }
+            .addOnFailureListener { if (c.isActive) c.resumeWithException(it) }
+    }
+
     private suspend fun capture(): Shot {
         val bmp = screenshot()
-        val text: Text = suspendCancellableCoroutine { c ->
-            recognizer.process(InputImage.fromBitmap(bmp, 0))
-                .addOnSuccessListener { if (c.isActive) c.resume(it) }
-                .addOnFailureListener { if (c.isActive) c.resumeWithException(it) }
+        return Shot(bmp, OcrParser.lines(ocrBitmap(bmp), panelRect()))
+    }
+
+    /** Divine counts read from the results popup: votes merged over up to 3 screenshots. */
+    private class DivineRead(val found: Boolean, val close: Point?, val votes: Map<String, List<Int>>, val rows: Int)
+
+    private suspend fun readDivine(names: List<String>, waitMs: Long): DivineRead {
+        val known = DivineReader.knownNames(names)
+        val votes = mutableMapOf<String, MutableList<Int>>()
+        var close: Point? = null
+        var rows = 0
+        val end = System.currentTimeMillis() + waitMs
+        var reads = 0
+        while (reads < 3) {
+            val shot = capture()
+            val r = DivineReader.read(shot.bmp, shot.lines, known, ::ocrBitmap)
+            if (!r.popupFound) {
+                if (reads == 0 && System.currentTimeMillis() < end) { delay(500); continue }
+                break
+            }
+            reads++
+            close = r.closePoint
+            rows = maxOf(rows, r.rows)
+            r.votes.forEach { (k, v) -> votes.getOrPut(k) { mutableListOf() } += v }
+            if (names.all { DivineReader.consensus(votes[it]) != null }) break
+            delay(300)
         }
-        return Shot(bmp, OcrParser.lines(text, panelRect()))
+        return DivineRead(reads > 0, close, votes, rows)
     }
 
     /** Average colour around a point: returns (r, g, b). */
@@ -406,28 +434,36 @@ class RerollService : AccessibilityService() {
             waitOpenAllDone(openAllIdle, pt.getValue(Spot.OPEN_ALL))
             delay(cfg.openAllDelay)
 
-            // 4. Summary popup -> read Divine counts -> tap again to close ("tap anywhere")
-            tap(pt.getValue(Spot.SUMMARY)); delay(cfg.summaryDelay)
-            var lines = capture().lines
-            if (!OcrParser.summaryVisible(lines)) {
-                delay(cfg.summaryDelay)
-                lines = capture().lines
-            }
-            if (!OcrParser.summaryVisible(lines)) {
-                finish("Summary popup not detected (#$rerolls). Raise the delays.", true); return
-            }
-            val counts = OcrParser.summaryCounts(lines, names)
-            tap(pt.getValue(Spot.SUMMARY)); delay(cfg.tapDelay)
+            // 4. Results popup (appears after Open All) -> read Divine counts -> close it
+            val read = readDivine(names, 10_000)
+            if (!read.found) { finish("Results popup not detected (#$rerolls). Raise the delays.", true); return }
+            read.close?.let { tap(it) }; delay(cfg.tapDelay)
 
-            lastResult = "Last: " + cfg.activeRules.joinToString(", ") { "${it.name} ${counts[it.name]}/${it.min}" }
-            val hits = cfg.activeRules.map { (counts[it.name] ?: 0) >= it.min }
+            // Decide. A count is "sure" when ≥2 independent reads agree. If unsure but any read
+            // reaches the target, stop anyway so a good roll is never thrown away.
+            var possible = false
+            val hits = cfg.activeRules.map { rule ->
+                val v = read.votes[rule.name]
+                val c = DivineReader.consensus(v)
+                when {
+                    c != null -> c >= rule.min
+                    v.isNullOrEmpty() -> false
+                    v.max() >= rule.min -> { possible = true; true }
+                    else -> false
+                }
+            }
+            lastResult = "Last: " + cfg.activeRules.joinToString(", ") { r ->
+                val v = read.votes[r.name]
+                "${r.name} ${DivineReader.consensus(v) ?: v?.joinToString("/")?.let { "?($it)" } ?: 0}/${r.min}"
+            }
             val ok = if (cfg.matchAll) hits.all { it } else hits.any { it }
+            if (ok && possible) { finish("⚠ POSSIBLE HIT after $rerolls rerolls – read unsure, please check!\n$lastResult", true); return }
             if (ok) { finish("🎉 TARGET HIT after $rerolls rerolls!\n$lastResult", true); return }
             setStatus("#$rerolls done  💎${gems ?: "?"}\n$lastResult")
         }
     }
 
-    /** Debug: read the current screen (open the Summary first) and show what was understood. */
+    /** Debug: read the current screen (results popup open) and show what was understood. */
     private fun testRead() {
         if (job?.isActive == true) return
         val cfg = Config.load(this)
@@ -438,10 +474,13 @@ class RerollService : AccessibilityService() {
                 val names = cfg.activeRules.map { it.name }.ifEmpty { DIVINE_PRESETS }
                 val gems = cfg.points[Spot.GEM_COUNTER]?.let { OcrParser.gemsNear(shot.lines, it) }
                 val panel = cfg.points[Spot.REROLL]?.let { isPanelOpen(shot, it) }
-                val counts = OcrParser.summaryCounts(shot.lines, names)
+                val r = readDivine(DivineReader.knownNames(names), 0)
                 setStatus(
-                    "💎 $gems | panel open: $panel | summary: ${OcrParser.summaryVisible(shot.lines)}\n" +
-                        counts.entries.joinToString("\n") { "${it.key}: ${it.value}" }
+                    "💎 $gems | panel open: $panel | popup: ${r.found} | rows: ${r.rows}\n" +
+                        DivineReader.knownNames(names).joinToString("\n") { n ->
+                            val v = r.votes[n]
+                            "$n: ${DivineReader.consensus(v) ?: "?"}  votes ${v ?: "-"}"
+                        }
                 )
             } catch (e: Exception) {
                 setStatus("Read error: ${e.message}")

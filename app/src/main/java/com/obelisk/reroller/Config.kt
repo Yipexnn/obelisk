@@ -13,7 +13,6 @@ enum class Spot(val label: String, val hint: String) {
     REROLL("Reroll", "Tap the REROLL button"),
     GEM("💎 200", "Tap the 💎200 refund button (Reroll panel must be open)"),
     OPEN_ALL("Open All", "Tap the OPEN ALL button"),
-    SUMMARY("Summary", "Tap the SUMMARY button"),
     GEM_COUNTER("Gem counter", "Tap your 💎 gem counter (top right number)"),
 }
 
