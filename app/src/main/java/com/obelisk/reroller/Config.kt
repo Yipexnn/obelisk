@@ -13,6 +13,7 @@ enum class Spot(val label: String, val hint: String) {
     REROLL("Reroll", "Tap the REROLL button"),
     GEM("💎 200", "Tap the 💎200 refund button (Reroll panel must be open)"),
     OPEN_ALL("Open All", "Tap the OPEN ALL button"),
+    SUMMARY("Summary", "Tap the SUMMARY button"),
     GEM_COUNTER("Gem counter", "Tap your 💎 gem counter (top right number)"),
 }
 
@@ -86,7 +87,7 @@ data class Config(
                 minGems = p.getLong("minGems", 100_000),
                 tapDelay = p.getLong("tapDelay", 700),
                 confirmDelay = p.getLong("confirmDelay", 500),
-                openAllDelay = p.getLong("openAllDelay", 2500),
+                openAllDelay = p.getLong("openAllDelay", 800),
                 summaryDelay = p.getLong("summaryDelay", 1200),
                 points = points,
             )

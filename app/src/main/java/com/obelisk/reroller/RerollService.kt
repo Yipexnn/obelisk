@@ -281,18 +281,52 @@ class RerollService : AccessibilityService() {
         throw last ?: RuntimeException("Screenshot failed")
     }
 
-    private suspend fun ocrScreen(): List<OLine> {
+    private class Shot(val bmp: Bitmap, val lines: List<OLine>)
+
+    private suspend fun capture(): Shot {
         val bmp = screenshot()
         val text: Text = suspendCancellableCoroutine { c ->
             recognizer.process(InputImage.fromBitmap(bmp, 0))
                 .addOnSuccessListener { if (c.isActive) c.resume(it) }
                 .addOnFailureListener { if (c.isActive) c.resumeWithException(it) }
         }
-        return OcrParser.lines(text, panelRect())
+        return Shot(bmp, OcrParser.lines(text, panelRect()))
     }
 
-    private fun isPanelOpen(lines: List<OLine>): Boolean {
-        val s = OcrParser.allText(lines)
+    /** Average colour around a point: returns (r, g, b). */
+    private fun colourAt(bmp: Bitmap, p: Point): Triple<Int, Int, Int> {
+        var r = 0; var g = 0; var b = 0; var n = 0
+        val cx = p.x.toInt(); val cy = p.y.toInt()
+        for (dx in -12..12 step 3) for (dy in -12..12 step 3) {
+            val x = cx + dx; val y = cy + dy
+            if (x !in 0 until bmp.width || y !in 0 until bmp.height) continue
+            val c = bmp.getPixel(x, y)
+            r += Color.red(c); g += Color.green(c); b += Color.blue(c); n++
+        }
+        if (n == 0) return Triple(0, 0, 0)
+        return Triple(r / n, g / n, b / n)
+    }
+
+    private fun luma(bmp: Bitmap, p: Point): Int {
+        val (r, g, b) = colourAt(bmp, p)
+        return (r * 3 + g * 6 + b) / 10
+    }
+
+    /** Waits until Open All has finished (button turns dim again), up to 30 s. */
+    private suspend fun waitOpenAllDone(idleLuma: Int, p: Point) {
+        delay(800)
+        val end = System.currentTimeMillis() + 30_000
+        while (System.currentTimeMillis() < end) {
+            if (luma(screenshot(), p) <= idleLuma + 8) return
+            delay(500)
+        }
+    }
+
+    /** Reroll button is orange when the panel is open, red when closed. */
+    private fun isPanelOpen(shot: Shot, p: Point): Boolean {
+        val (r, g, _) = colourAt(shot.bmp, p)
+        if (r > 150 && g > r * 0.35) return true
+        val s = OcrParser.allText(shot.lines)
         return "refunds" in s || "open them again" in s
     }
 
@@ -339,9 +373,9 @@ class RerollService : AccessibilityService() {
         while (true) {
             if (rerolls >= cfg.maxRerolls) { finish("Max rerolls reached ($rerolls)\n$lastResult", true); return }
 
-            // 1. Make sure the reroll panel is open; read gems.
-            var screen = ocrScreen()
-            val gems = OcrParser.gemsNear(screen, pt.getValue(Spot.GEM_COUNTER))
+            // 1. Read gems; make sure the reroll panel is open (orange Reroll button).
+            var shot = capture()
+            val gems = OcrParser.gemsNear(shot.lines, pt.getValue(Spot.GEM_COUNTER))
             if (gems != null) {
                 if (gems - 200 < cfg.minGems) { finish("Gem limit reached (💎$gems)\n$lastResult", true); return }
                 if (lastGems != null && gems >= lastGems) {
@@ -350,11 +384,16 @@ class RerollService : AccessibilityService() {
                 } else noChange = 0
                 lastGems = gems
             }
-            if (!isPanelOpen(screen)) {
+            if (!isPanelOpen(shot, pt.getValue(Spot.REROLL))) {
                 tap(pt.getValue(Spot.REROLL)); delay(cfg.tapDelay)
-                screen = ocrScreen()
-                if (!isPanelOpen(screen)) { finish("Could not open Reroll panel. Check calibration.", true); return }
+                shot = capture()
+                if (!isPanelOpen(shot, pt.getValue(Spot.REROLL))) {
+                    finish("Could not open Reroll panel. Check calibration.", true); return
+                }
             }
+
+            // Open All is dim now (nothing to open) – remember that brightness.
+            val openAllIdle = luma(shot.bmp, pt.getValue(Spot.OPEN_ALL))
 
             // 2. 💎200 -> confirm (second tap)
             setStatus("#${rerolls + 1}: rerolling…  💎${gems ?: "?"}\n$lastResult")
@@ -362,21 +401,25 @@ class RerollService : AccessibilityService() {
             tap(pt.getValue(Spot.GEM)); delay(cfg.tapDelay)
             rerolls++
 
-            // 3. Open All
-            tap(pt.getValue(Spot.OPEN_ALL)); delay(cfg.openAllDelay)
+            // 3. Open All -> wait until the button is dim again (all opened), then extra wait
+            tap(pt.getValue(Spot.OPEN_ALL))
+            waitOpenAllDone(openAllIdle, pt.getValue(Spot.OPEN_ALL))
+            delay(cfg.openAllDelay)
 
-            // 4. Read divine counts from the relic list
-            var lines = ocrScreen()
-            if (!OcrParser.divineVisible(lines, names)) {
-                delay(cfg.openAllDelay)
-                lines = ocrScreen()
+            // 4. Summary popup -> read Divine counts -> tap again to close ("tap anywhere")
+            tap(pt.getValue(Spot.SUMMARY)); delay(cfg.summaryDelay)
+            var lines = capture().lines
+            if (!OcrParser.summaryVisible(lines)) {
+                delay(cfg.summaryDelay)
+                lines = capture().lines
             }
-            if (!OcrParser.divineVisible(lines, names)) {
-                finish("Divine list not visible (#$rerolls). Scroll so the Divine slots are on screen.", true); return
+            if (!OcrParser.summaryVisible(lines)) {
+                finish("Summary popup not detected (#$rerolls). Raise the delays.", true); return
             }
+            val counts = OcrParser.summaryCounts(lines, names)
+            tap(pt.getValue(Spot.SUMMARY)); delay(cfg.tapDelay)
 
-            val counts = OcrParser.divineCounts(lines, names)
-            lastResult = "Last: " + cfg.activeRules.joinToString(", ") { "${it.name} ${counts[it.name] ?: 0}/${it.min}" }
+            lastResult = "Last: " + cfg.activeRules.joinToString(", ") { "${it.name} ${counts[it.name]}/${it.min}" }
             val hits = cfg.activeRules.map { (counts[it.name] ?: 0) >= it.min }
             val ok = if (cfg.matchAll) hits.all { it } else hits.any { it }
             if (ok) { finish("🎉 TARGET HIT after $rerolls rerolls!\n$lastResult", true); return }
@@ -384,20 +427,21 @@ class RerollService : AccessibilityService() {
         }
     }
 
-    /** Debug: OCR the current screen and show what was understood. */
+    /** Debug: read the current screen (open the Summary first) and show what was understood. */
     private fun testRead() {
         if (job?.isActive == true) return
         val cfg = Config.load(this)
         scope.launch {
             try {
                 setStatus("Reading…")
-                val t = ocrScreen()
+                val shot = capture()
                 val names = cfg.activeRules.map { it.name }.ifEmpty { DIVINE_PRESETS }
-                val gems = cfg.points[Spot.GEM_COUNTER]?.let { OcrParser.gemsNear(t, it) }
-                val counts = OcrParser.divineCounts(t, names)
+                val gems = cfg.points[Spot.GEM_COUNTER]?.let { OcrParser.gemsNear(shot.lines, it) }
+                val panel = cfg.points[Spot.REROLL]?.let { isPanelOpen(shot, it) }
+                val counts = OcrParser.summaryCounts(shot.lines, names)
                 setStatus(
-                    "💎 $gems | reroll panel open: ${isPanelOpen(t)}\n" +
-                        counts.entries.joinToString("\n") { "${it.key}: ${it.value ?: "not found"}" }
+                    "💎 $gems | panel open: $panel | summary: ${OcrParser.summaryVisible(shot.lines)}\n" +
+                        counts.entries.joinToString("\n") { "${it.key}: ${it.value}" }
                 )
             } catch (e: Exception) {
                 setStatus("Read error: ${e.message}")

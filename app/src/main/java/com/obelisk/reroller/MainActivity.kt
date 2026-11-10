@@ -28,6 +28,7 @@ class MainActivity : Activity() {
     private lateinit var tapDelay: EditText
     private lateinit var confirmDelay: EditText
     private lateinit var openAllDelay: EditText
+    private lateinit var summaryDelay: EditText
     private lateinit var serviceState: TextView
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -48,7 +49,7 @@ class MainActivity : Activity() {
         text(
             "1. App info → ⋮ → 'Allow restricted settings' (needed for side-loaded apps)\n" +
                 "2. Enable 'Obelisk Reroller' in Accessibility\n" +
-                "3. In the game open the Reroll panel (Divine slots visible), press 'Calib' on the floating panel and tap each button as asked\n" +
+                "3. In the game open the Reroll panel then press 'Calib' on the floating panel and tap each button as asked\n" +
                 "4. Set targets below → Save → press ▶ Start on the floating panel"
         )
         serviceState = text("")
@@ -95,7 +96,8 @@ class MainActivity : Activity() {
         header("Timing (ms) – raise if your phone lags")
         tapDelay = labeled("Wait after tap", cfg.tapDelay.toString())
         confirmDelay = labeled("Wait between 💎200 taps", cfg.confirmDelay.toString())
-        openAllDelay = labeled("Wait after Open All (relics revealed)", cfg.openAllDelay.toString())
+        openAllDelay = labeled("Extra wait after Open All finished", cfg.openAllDelay.toString())
+        summaryDelay = labeled("Wait for Summary popup", cfg.summaryDelay.toString())
 
         root.addView(button("💾 Save") { save() })
     }
@@ -121,7 +123,7 @@ class MainActivity : Activity() {
             tapDelay = tapDelay.text.toString().toLongOrNull() ?: old.tapDelay,
             confirmDelay = confirmDelay.text.toString().toLongOrNull() ?: old.confirmDelay,
             openAllDelay = openAllDelay.text.toString().toLongOrNull() ?: old.openAllDelay,
-            summaryDelay = old.summaryDelay,
+            summaryDelay = summaryDelay.text.toString().toLongOrNull() ?: old.summaryDelay,
             points = old.points,
         ).save(this)
         Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()

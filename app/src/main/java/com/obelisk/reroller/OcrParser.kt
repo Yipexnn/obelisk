@@ -78,6 +78,67 @@ object OcrParser {
         return (names + DIVINE_PRESETS).any { bestNameLine(lines, it) != null }
     }
 
+    // ------------------------------------------------------------ Summary popup
+
+    private val summaryCountRe = Regex("""[0-9OoIl|]+\s*[xX×]\s*[)\]}]""")
+    private val prefixCountRe = Regex("""([0-9OoIlS|]{1,6})\s*[xX×]""")
+
+    /** True if the Summary popup ("Loot from", "(123x) …" rows) is on screen. */
+    fun summaryVisible(lines: List<OLine>): Boolean {
+        val all = allText(lines)
+        if ("loot from" in all || "tap anywhere" in all) return true
+        return lines.count { summaryCountRe.containsMatchIn(it.text) } >= 5
+    }
+
+    /**
+     * Best approximate match of [target] anywhere inside [hay] (sliding window).
+     * Returns (score 0..1, end index of the match in hay).
+     */
+    private fun windowMatch(hay: String, target: String): Pair<Double, Int> {
+        if (hay.isEmpty() || target.isEmpty()) return 0.0 to 0
+        var best = 0.0 to 0
+        val n = target.length
+        for (len in maxOf(1, n - 2)..(n + 2)) {
+            if (len > hay.length) {
+                val sc = similarity(hay, target)
+                if (sc > best.first) best = sc to hay.length
+                break
+            }
+            for (i in 0..hay.length - len) {
+                val sc = similarity(hay.substring(i, i + len), target)
+                if (sc > best.first) best = sc to i
+            }
+        }
+        return best
+    }
+
+    /**
+     * Reads Summary rows like "(4x) Supernova Multipliers +2x".
+     * Name is matched fuzzily anywhere in the line; the count is the "Nx" before it, or on a
+     * separate OCR line to the left on the same row. Missing relics count as 0.
+     */
+    fun summaryCounts(lines: List<OLine>, names: List<String>): Map<String, Int> =
+        names.associateWith { name ->
+            val target = norm(name)
+            val hit = lines.map { l ->
+                val nameArea = l.text.substringBefore('+')
+                l to windowMatch(norm(nameArea), target).first
+            }.filter { it.second >= 0.8 }.maxByOrNull { it.second }?.first ?: return@associateWith 0
+
+            fun countIn(s: String): Int? = prefixCountRe.find(s)?.groupValues?.get(1)
+                ?.let { digits(it).replace('S', '5') }?.toIntOrNull()
+
+            // Only look before the first word, so "Fishing Tick 5x" isn't taken as the count.
+            val firstWord = Regex("[A-Za-z]{3,}").find(hit.text)?.range?.first ?: hit.text.length
+            countIn(hit.text.substring(0, firstWord)) ?: run {
+                val b = hit.box
+                lines.filter {
+                    it !== hit && it.box.right <= b.left + b.height() &&
+                        abs(it.box.centerY() - b.centerY()) < b.height() * 0.6
+                }.maxByOrNull { it.box.right }?.let { countIn(it.text) }
+            } ?: 0
+        }
+
     fun similarity(a: String, b: String): Double {
         if (a.isEmpty() || b.isEmpty()) return 0.0
         return 1.0 - levenshtein(a, b).toDouble() / max(a.length, b.length)
