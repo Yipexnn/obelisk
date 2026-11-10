@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Obelisk Reroller</string>
+    <string name="service_desc">Automatically rerolls relics (Reroll → 💎200 → confirm → Open All → Summary) until your Divine relic targets are reached. Reads the screen with on-device text recognition and performs taps.</string>
+</resources>
