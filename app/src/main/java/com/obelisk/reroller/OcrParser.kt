@@ -6,62 +6,77 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-/** One visual row of text (OCR lines on the same height joined left-to-right). */
-data class Row(val text: String, val box: Rect)
-
-/** A summary entry like "(7x) Rainbow Floor Chance +1%". */
-data class Entry(val count: Int, val name: String)
+/** One OCR line with its words. */
+data class OLine(val text: String, val box: Rect, val words: List<Pair<String, Rect>>)
 
 object OcrParser {
 
-    fun rows(text: Text): List<Row> {
-        val lines = text.textBlocks.flatMap { it.lines }.filter { it.boundingBox != null }
-        val sorted = lines.sortedBy { it.boundingBox!!.centerY() }
-        val groups = mutableListOf<MutableList<Text.Line>>()
-        for (l in sorted) {
-            val b = l.boundingBox!!
-            val g = groups.lastOrNull()
-            if (g != null) {
-                val gb = g.first().boundingBox!!
-                if (abs(gb.centerY() - b.centerY()) < max(gb.height(), b.height()) * 0.5) {
-                    g += l; continue
-                }
+    /** Flattens ML Kit output, dropping anything inside [exclude] (our own floating panel). */
+    fun lines(text: Text, exclude: Rect?): List<OLine> =
+        text.textBlocks.flatMap { it.lines }
+            .filter { it.boundingBox != null }
+            .filter { l -> exclude == null || !Rect.intersects(exclude, l.boundingBox!!) }
+            .map { l ->
+                OLine(
+                    l.text,
+                    l.boundingBox!!,
+                    l.elements.filter { it.boundingBox != null }.map { it.text to it.boundingBox!! },
+                )
             }
-            groups += mutableListOf(l)
-        }
-        return groups.map { g ->
-            val s = g.sortedBy { it.boundingBox!!.left }
-            val r = Rect(s.first().boundingBox!!)
-            s.forEach { r.union(it.boundingBox!!) }
-            Row(s.joinToString(" ") { it.text }, r)
-        }
-    }
 
-    fun allText(text: Text) = text.text.lowercase()
-
-    // "(7x) Name +1%" – tolerates a checkbox glyph before it and OCR slips like "(7X" / "(lx)".
-    private val countRe = Regex("""^[^0-9(]{0,4}\(\s*([0-9OoIl|]{1,6})\s*[xX×]\s*\)?\s*(.*)$""")
-
-    fun entries(rows: List<Row>): List<Entry> = rows.mapNotNull { row ->
-        val m = countRe.find(row.text.trim()) ?: return@mapNotNull null
-        val digits = m.groupValues[1]
-            .replace('O', '0').replace('o', '0')
-            .replace('I', '1').replace('l', '1').replace('|', '1')
-        val n = digits.toIntOrNull() ?: return@mapNotNull null
-        val name = m.groupValues[2].substringBefore('+').trim()
-        if (name.isEmpty()) null else Entry(n, name)
-    }
+    fun allText(lines: List<OLine>) = lines.joinToString("\n") { it.text }.lowercase()
 
     fun norm(s: String) = s.lowercase().filter { it.isLetterOrDigit() }
 
-    /** Count for each rule name, best fuzzy match among entries (0 if not found). */
-    fun countsFor(entries: List<Entry>, names: List<String>): Map<String, Int> =
+    /** Relic name part of a line: "Supernova Multipliers +2x" -> "supernovamultipliers". */
+    private fun nameOf(s: String) = norm(s.substringBefore('+'))
+
+    private val countRe = Regex("""^\s*([0-9OoIl|]{1,3})\s*(?:/\s*[0-9OoIl|]{1,3})?\s*$""")
+
+    private fun digits(s: String) = s.replace('O', '0').replace('o', '0')
+        .replace('I', '1').replace('l', '1').replace('|', '1')
+
+    /** Parses "7/7", "1/7", "3". Returns null if the line isn't a count. */
+    private fun parseCount(raw: String): Int? {
+        val t = raw.trim()
+        val m = countRe.find(t) ?: return null
+        val first = digits(m.groupValues[1])
+        // A "7/7" whose slash was read as "1" ("717"): keep the first digit.
+        if (!t.contains('/') && first.length == 3 && first[1] == '1') return first[0].digitToIntOrNull()
+        return first.toIntOrNull()
+    }
+
+    private fun bestNameLine(lines: List<OLine>, name: String): OLine? {
+        val target = norm(name)
+        return lines.map { it to similarity(nameOf(it.text), target) }
+            .filter { it.second >= 0.8 }
+            .maxByOrNull { it.second }?.first
+    }
+
+    /**
+     * Reads the Divine list shown after opening relics. Each slot has the name in the middle and
+     * the count ("7/7", "1/7" or "3") in the top-right box, slightly above the name's centre.
+     * Returns null for names not on screen (slot not found yet -> treat as 0).
+     */
+    fun divineCounts(lines: List<OLine>, names: List<String>): Map<String, Int?> =
         names.associateWith { name ->
-            val target = norm(name)
-            entries.map { it to similarity(norm(it.name), target) }
-                .filter { it.second >= 0.8 }
-                .maxByOrNull { it.second }?.first?.count ?: 0
+            val nl = bestNameLine(lines, name) ?: return@associateWith null
+            val b = nl.box
+            val h = max(b.height(), 20)
+            lines.asSequence()
+                .filter { it !== nl && it.box.left >= b.right - h }
+                .filter { it.box.centerY() >= b.top - h * 1.5 && it.box.centerY() <= b.centerY() + h * 0.3 }
+                .mapNotNull { l -> parseCount(l.text)?.let { it to l } }
+                .minByOrNull { abs(it.second.box.centerY() - b.top) }
+                ?.first ?: 0
         }
+
+    /** True if the Divine list seems to be on screen at all. */
+    fun divineVisible(lines: List<OLine>, names: List<String>): Boolean {
+        val all = allText(lines)
+        if ("not found yet" in all || "divine relics" in all) return true
+        return (names + DIVINE_PRESETS).any { bestNameLine(lines, it) != null }
+    }
 
     fun similarity(a: String, b: String): Double {
         if (a.isEmpty() || b.isEmpty()) return 0.0
@@ -84,24 +99,19 @@ object OcrParser {
 
     private val numRe = Regex("""(\d+(?:[.,]\d+)?)\s*(?:[eE]\s*(\d+))?""")
 
-    /** Reads the gem counter: the OCR element closest to the calibrated point. */
-    fun gemsNear(text: Text, p: Point): Long? {
-        val elements = text.textBlocks.flatMap { b -> b.lines.flatMap { it.elements } }
-            .filter { it.boundingBox != null }
-        val best = elements
-            .filter { it.text.any { c -> c.isDigit() } }
-            .minByOrNull { e ->
-                val b = e.boundingBox!!
-                val dx = max(0f, max(b.left - p.x, p.x - b.right))
-                val dy = max(0f, max(b.top - p.y, p.y - b.bottom))
-                dx * dx + dy * dy
-            } ?: return null
-        val b = best.boundingBox!!
+    private fun dist2(b: Rect, p: Point): Float {
         val dx = max(0f, max(b.left - p.x, p.x - b.right))
         val dy = max(0f, max(b.top - p.y, p.y - b.bottom))
-        if (dx > 250 || dy > 80) return null
-        val cleaned = best.text.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1')
-        val m = numRe.find(cleaned) ?: return null
+        return dx * dx + dy * dy
+    }
+
+    /** Reads the gem counter: the number closest to the calibrated point. */
+    fun gemsNear(lines: List<OLine>, p: Point): Long? {
+        val best = lines.flatMap { it.words }
+            .filter { w -> w.first.any { it.isDigit() } }
+            .minByOrNull { dist2(it.second, p) } ?: return null
+        if (dist2(best.second, p) > 250f * 250f) return null
+        val m = numRe.find(digits(best.first)) ?: return null
         val base = m.groupValues[1].replace(',', '.').toDoubleOrNull() ?: return null
         val exp = m.groupValues[2].toIntOrNull() ?: 0
         val v = base * Math.pow(10.0, exp.toDouble())

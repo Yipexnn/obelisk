@@ -9,6 +9,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.os.VibrationEffect
 import android.os.VibratorManager
 import android.view.Display
@@ -94,7 +95,7 @@ class RerollService : AccessibilityService() {
     }
 
     @SuppressLint("ClickableViewAccessibility")
-    private fun showPanel() {
+    fun showPanel() {
         if (panel != null) return
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -102,9 +103,22 @@ class RerollService : AccessibilityService() {
             setPadding(dp(6), dp(4), dp(6), dp(6))
         }
         val header = TextView(this).apply {
-            text = "≡ Reroller  (drag / tap to hide)"
+            text = "≡ Reroller (drag / tap)"
             setTextColor(Color.YELLOW)
             textSize = 12f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val close = TextView(this).apply {
+            text = "  ✕  "
+            setTextColor(Color.RED)
+            textSize = 16f
+            setOnClickListener { hidePanel() }
+        }
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(header)
+            addView(close)
         }
         body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         status = TextView(this).apply {
@@ -122,7 +136,7 @@ class RerollService : AccessibilityService() {
         }
         body.addView(row)
         body.addView(status)
-        root.addView(header)
+        root.addView(headerRow)
         root.addView(body)
 
         panelParams = WindowManager.LayoutParams(
@@ -160,8 +174,22 @@ class RerollService : AccessibilityService() {
         panel = root
     }
 
+    fun hidePanel() {
+        if (job?.isActive == true) stopLoop("Stopped (panel closed)")
+        panel?.let { runCatching { wm.removeView(it) } }
+        panel = null
+    }
+
+    /** Screen area covered by our own panel, so OCR ignores its text. */
+    private fun panelRect(): Rect? {
+        val p = panel ?: return null
+        val loc = IntArray(2)
+        p.getLocationOnScreen(loc)
+        return Rect(loc[0], loc[1], loc[0] + p.width, loc[1] + p.height)
+    }
+
     private fun setStatus(s: String) {
-        status.text = s
+        if (panel != null) status.text = s
     }
 
     private fun setKeepScreenOn(on: Boolean) {
@@ -253,17 +281,18 @@ class RerollService : AccessibilityService() {
         throw last ?: RuntimeException("Screenshot failed")
     }
 
-    private suspend fun ocrScreen(): Text {
+    private suspend fun ocrScreen(): List<OLine> {
         val bmp = screenshot()
-        return suspendCancellableCoroutine { c ->
+        val text: Text = suspendCancellableCoroutine { c ->
             recognizer.process(InputImage.fromBitmap(bmp, 0))
                 .addOnSuccessListener { if (c.isActive) c.resume(it) }
                 .addOnFailureListener { if (c.isActive) c.resumeWithException(it) }
         }
+        return OcrParser.lines(text, panelRect())
     }
 
-    private fun isPanelOpen(t: Text): Boolean {
-        val s = OcrParser.allText(t)
+    private fun isPanelOpen(lines: List<OLine>): Boolean {
+        val s = OcrParser.allText(lines)
         return "refunds" in s || "open them again" in s
     }
 
@@ -336,18 +365,18 @@ class RerollService : AccessibilityService() {
             // 3. Open All
             tap(pt.getValue(Spot.OPEN_ALL)); delay(cfg.openAllDelay)
 
-            // 4. Summary -> read divine counts
-            tap(pt.getValue(Spot.SUMMARY)); delay(cfg.summaryDelay)
-            var entries = OcrParser.entries(OcrParser.rows(ocrScreen()))
-            if (entries.size < 3) {
-                delay(cfg.summaryDelay)
-                entries = OcrParser.entries(OcrParser.rows(ocrScreen()))
+            // 4. Read divine counts from the relic list
+            var lines = ocrScreen()
+            if (!OcrParser.divineVisible(lines, names)) {
+                delay(cfg.openAllDelay)
+                lines = ocrScreen()
             }
-            tap(pt.getValue(Spot.CLOSE)); delay(cfg.tapDelay)
-            if (entries.size < 3) { finish("Summary not readable (#$rerolls). Check calibration/delays.", true); return }
+            if (!OcrParser.divineVisible(lines, names)) {
+                finish("Divine list not visible (#$rerolls). Scroll so the Divine slots are on screen.", true); return
+            }
 
-            val counts = OcrParser.countsFor(entries, names)
-            lastResult = "Last: " + cfg.activeRules.joinToString(", ") { "${it.name} ${counts[it.name]}/${it.min}" }
+            val counts = OcrParser.divineCounts(lines, names)
+            lastResult = "Last: " + cfg.activeRules.joinToString(", ") { "${it.name} ${counts[it.name] ?: 0}/${it.min}" }
             val hits = cfg.activeRules.map { (counts[it.name] ?: 0) >= it.min }
             val ok = if (cfg.matchAll) hits.all { it } else hits.any { it }
             if (ok) { finish("🎉 TARGET HIT after $rerolls rerolls!\n$lastResult", true); return }
@@ -363,12 +392,12 @@ class RerollService : AccessibilityService() {
             try {
                 setStatus("Reading…")
                 val t = ocrScreen()
-                val entries = OcrParser.entries(OcrParser.rows(t))
+                val names = cfg.activeRules.map { it.name }.ifEmpty { DIVINE_PRESETS }
                 val gems = cfg.points[Spot.GEM_COUNTER]?.let { OcrParser.gemsNear(t, it) }
-                val counts = OcrParser.countsFor(entries, cfg.activeRules.map { it.name })
+                val counts = OcrParser.divineCounts(t, names)
                 setStatus(
-                    "💎 $gems | panel open: ${isPanelOpen(t)} | rows: ${entries.size}\n" +
-                        counts.entries.joinToString("\n") { "${it.key}: ${it.value}" }
+                    "💎 $gems | reroll panel open: ${isPanelOpen(t)}\n" +
+                        counts.entries.joinToString("\n") { "${it.key}: ${it.value ?: "not found"}" }
                 )
             } catch (e: Exception) {
                 setStatus("Read error: ${e.message}")
